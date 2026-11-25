@@ -116,13 +116,19 @@ fn program(wide: bool, descriptor: Descriptor) -> Vec<u32> {
 }
 
 fn native(words: &[u32]) -> NativeProgram {
+    native_with(words, 4)
+}
+
+/// [`native`] with the descriptor entries declared `dwords` long: the
+/// console's two buffer sizes, 4 and 8.
+fn native_with(words: &[u32], dwords: u8) -> NativeProgram {
     let table = |kind, at| UsedResource {
         kind,
         root: RootType::Table,
         table_offset_dwords: at,
         lower_bound: 0,
         stride: 4,
-        dwords: 4,
+        dwords,
         user_data: 4,
         slot: 1,
     };
@@ -162,7 +168,16 @@ fn build(
     wide: bool,
     descriptor: Descriptor,
 ) -> Result<(HostShader, resource::Resources), ShaderError> {
-    let native = native(&program(wide, descriptor));
+    build_with(wide, descriptor, 4)
+}
+
+/// [`build`] with the descriptor entries declared `dwords` long.
+fn build_with(
+    wide: bool,
+    descriptor: Descriptor,
+    dwords: u8,
+) -> Result<(HostShader, resource::Resources), ShaderError> {
+    let native = native_with(&program(wide, descriptor), dwords);
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     let st = structure::structure(&p).expect("structure");
     let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
@@ -687,4 +702,99 @@ fn a_structure_that_returns_triangle_ids_is_refused_by_name() {
         }
         other => panic!("{:?}", other.map(|_| ())),
     }
+}
+
+/// A buffer descriptor declared 8 dwords long is translated when only its
+/// address is read, exactly as a 4-dword one is.
+///
+/// `view_address` used to refuse anything but `dwords == 4`, on no evidence:
+/// the host fills the address from the view at that dword of the table
+/// (`crate::descriptor::view(table + dword * 4)`), which does not care how
+/// long the entry is. That refusal is what five shaders in #38 hit ("a
+/// descriptor read only as data", compute `2fd01fca16993001` and four
+/// others), and neither side of it was tested.
+///
+/// The program is the ray-tracing one above, which takes a table entry's
+/// address; the only difference between the two calls is the declared length
+/// of the entry.
+#[test]
+fn a_descriptor_declared_eight_dwords_still_gives_its_address() {
+    for wide in [false, true] {
+        let four = build_with(wide, Descriptor::Table, 4);
+        let eight = build_with(wide, Descriptor::Table, 8);
+        assert!(
+            four.is_ok(),
+            "the 4-dword form translates (it always did): {:?}",
+            four.err()
+        );
+        assert!(
+            eight.is_ok(),
+            "the 8-dword form is refused: {:?} — the address is in the same two \
+             dwords and the host fills it the same way",
+            eight.err()
+        );
+    }
+}
+
+/// A table entry read as plain numbers by `s_load_dwordx8`, with nothing
+/// using it as a descriptor: the branch that answers with the view's
+/// address and marks the rest missing.
+///
+/// That branch used to require `count <= 4`, so a `s_load_dwordx8` (8) or
+/// `s_load_dwordx16` (16) of a descriptor was refused outright with "a
+/// descriptor read only as data" — which is what five shaders in #38 hit
+/// (`2fd01fca16993001` and four others). Nothing about the host side needs
+/// the limit: it fills dwords 0 and 1 from the view at that table offset
+/// (`draw.rs`, `USER_VIEW_ADDRESS`) and never looks at the count.
+///
+/// The rest of the dwords are `Missing`, as dwords 2 and 3 already were for
+/// a `s_load_dwordx4`, so a program that only takes the address works and
+/// one that does arithmetic on the other dwords is refused where it uses
+/// them — the same contract at every length.
+#[test]
+fn a_descriptor_load_of_eight_dwords_answers_with_the_address() {
+    // s_mov_b32 s5, 0
+    // s_load_dwordx8 s[8:15], s[4:5], 0x0
+    // s_endpgm
+    let words = [
+        0xBE85_0380u32,
+        0xF40C_0202,
+        0xFA00_0000, // s_load_dwordx8 s[8:15], s[4:5], 0x0
+        0xBF81_0000,
+    ];
+    let native = native_with(&words, 8);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("tracked");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let lowered = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+    })
+    .expect("an 8-dword descriptor load of an unused entry lowers");
+    // The host fills the address: the program asks for the two
+    // `USER_VIEW_ADDRESS` dwords and nothing else.
+    let asks = lowered
+        .user_data
+        .iter()
+        .filter(|u| {
+            matches!(
+                u.root,
+                RootType::Other(c) if c == crate::emit::USER_VIEW_ADDRESS
+                    || c == crate::emit::USER_VIEW_ADDRESS + 1
+            )
+        })
+        .count();
+    assert_eq!(
+        asks, 2,
+        "the address is two host dwords, whatever the load's length: {:?}",
+        lowered.user_data
+    );
 }
