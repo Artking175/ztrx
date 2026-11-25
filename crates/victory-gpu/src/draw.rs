@@ -95,7 +95,7 @@ struct Window {
     step: u32,
     base: u64,
     records: u32,
-    scratch: ID3D12Resource,
+    scratch: crate::indirect::BoundedArgs,
 }
 
 /// The most records clamped in one pass ([`windows`]).
@@ -2452,7 +2452,7 @@ impl State {
             list.list.ExecuteIndirect(
                 &signature,
                 max,
-                &bounded,
+                &bounded.buffer,
                 at,
                 counter.as_ref().map(|(s, _)| &s.buffer),
                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),

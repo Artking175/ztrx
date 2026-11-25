@@ -238,10 +238,23 @@ fn validate_layout(
     (bytes <= u64::from(u32::MAX)).then_some(bytes)
 }
 
+#[derive(Clone, Copy)]
+enum ClampBarriers {
+    Legacy,
+    Enhanced,
+}
+
+/// Scratch arguments and the barriers used to prepare them.
+#[derive(Clone)]
+pub(crate) struct BoundedArgs {
+    pub(crate) buffer: ID3D12Resource,
+    barriers: ClampBarriers,
+}
+
 /// Records, in `list`, the non-destructive clamp of up to `records` records of
 /// `kind` (PC argument numbering) `stride` bytes apart from `src` (and bounded
 /// by the 32-bit count in `count` when given) into a device-local scratch
-/// buffer, leaving that scratch buffer in `INDIRECT_ARGUMENT` at offset `0`.
+/// buffer, ready to use as indirect arguments at offset `0`.
 /// Replaces the list's compute root signature and pipeline (callers bind
 /// theirs after). `None` if the clamp or alignment is not available.
 pub(crate) fn bound(
@@ -249,10 +262,14 @@ pub(crate) fn bound(
     src: (&ID3D12Resource, u64),
     count: Option<(&ID3D12Resource, u64)>,
     spec: (u32, u32, u32),
-) -> Option<ID3D12Resource> {
+) -> Option<BoundedArgs> {
     let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    record_clamp(c, &list.list, &dst, budget, src, count, spec).then_some(dst)
+    let barriers = record_clamp(c, &list.list, &dst, budget, src, count, spec)?;
+    Some(BoundedArgs {
+        buffer: dst,
+        barriers,
+    })
 }
 
 /// [`bound`] for a window of records clamped ahead of the draws that will
@@ -269,10 +286,14 @@ pub(crate) fn bound_ahead(
     list: &HostList,
     src: (&ID3D12Resource, u64),
     spec: (u32, u32, u32),
-) -> Option<ID3D12Resource> {
+) -> Option<BoundedArgs> {
     let bytes = validate_layout(spec, src.1, None)?;
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    record_clamp_as(c, &list.list, &dst, budget, src, None, spec, true).then_some(dst)
+    let barriers = record_clamp_as(c, &list.list, &dst, budget, src, None, spec, true)?;
+    Some(BoundedArgs {
+        buffer: dst,
+        barriers,
+    })
 }
 
 fn record_clamp(
@@ -283,7 +304,7 @@ fn record_clamp(
     src: (&ID3D12Resource, u64),
     count: Option<(&ID3D12Resource, u64)>,
     spec: (u32, u32, u32),
-) -> bool {
+) -> Option<ClampBarriers> {
     record_clamp_as(c, l, dst, budget, src, count, spec, false)
 }
 
@@ -299,18 +320,16 @@ fn record_clamp_as(
     count: Option<(&ID3D12Resource, u64)>,
     (kind, stride, records): (u32, u32, u32),
     ahead: bool,
-) -> bool {
-    let Some(bytes) = validate_layout(
+) -> Option<ClampBarriers> {
+    let bytes = validate_layout(
         (kind, stride, records),
         src_offset,
         count.map(|(_, off)| off),
-    ) else {
-        return false;
-    };
+    )?;
     // SAFETY: live D3D12 buffer resources.
     let (src_base, dst_gpu) = unsafe { (src.GetGPUVirtualAddress(), dst.GetGPUVirtualAddress()) };
     if !src_base.is_multiple_of(4) || !dst_gpu.is_multiple_of(4) || !budget.is_multiple_of(4) {
-        return false;
+        return None;
     }
     let (src_gpu, args_offset) = match src_offset
         .checked_add(bytes)
@@ -318,9 +337,7 @@ fn record_clamp_as(
     {
         Some(_) => (src_base, src_offset as u32),
         None => {
-            let Some(rebased) = src_base.checked_add(src_offset) else {
-                return false;
-            };
+            let rebased = src_base.checked_add(src_offset)?;
             (rebased, 0)
         }
     };
@@ -329,14 +346,12 @@ fn record_clamp_as(
             // SAFETY: a live D3D12 buffer resource.
             let base = unsafe { buf.GetGPUVirtualAddress() };
             if !base.is_multiple_of(4) {
-                return false;
+                return None;
             }
             match off.checked_add(4).filter(|&end| end <= u64::from(u32::MAX)) {
                 Some(_) => (base, 1u32, off as u32),
                 None => {
-                    let Some(rebased) = base.checked_add(off) else {
-                        return false;
-                    };
+                    let rebased = base.checked_add(off)?;
                     (rebased, 1u32, 0u32)
                 }
             }
@@ -441,7 +456,7 @@ fn record_clamp_as(
             for barrier in after.into_iter().chain(reuse) {
                 drop(std::mem::ManuallyDrop::into_inner(barrier.pResource));
             }
-            return true;
+            return Some(ClampBarriers::Enhanced);
         }
     }
     unsafe {
@@ -459,13 +474,13 @@ fn record_clamp_as(
         }
         l.ResourceBarrier(&second[skip..]);
     }
-    true
+    Some(ClampBarriers::Legacy)
 }
 
 /// After indirect execution (or if preparation failed after [`bound`]):
-/// returns the scratch buffer to the common state for the next call.
-pub(crate) fn done(list: &HostList, scratch: &ID3D12Resource) {
-    done_on(&list.list, scratch);
+/// returns a scratch buffer prepared with legacy barriers to the common state.
+pub(crate) fn done(list: &HostList, args: &BoundedArgs) {
+    done_on(&list.list, &args.buffer, args.barriers);
 }
 
 /// Whether the clamp's two waits are enhanced barriers that wait for what
@@ -502,10 +517,12 @@ fn narrow_waits() -> bool {
     })
 }
 
-fn done_on(list: &ID3D12GraphicsCommandList, scratch: &ID3D12Resource) {
-    // Barred with enhanced barriers only (`narrow_waits`): no state to
-    // give back.
-    if narrow_waits() {
+fn done_on(
+    list: &ID3D12GraphicsCommandList,
+    scratch: &ID3D12Resource,
+    barriers: ClampBarriers,
+) {
+    if let ClampBarriers::Enhanced = barriers {
         return;
     }
     // SAFETY: an open list and a live scratch buffer in INDIRECT_ARGUMENT.
@@ -943,7 +960,7 @@ void main() {
         // Record Call #1 (`eff_count = 3` out of `MAX = 4096`), copy the first
         // 5 records of `dst_buf` out for inspection, then record Call #2
         // (`eff_count = 2` out of `MAX = 4096`) reusing `dst_buf` in the same list!
-        assert!(record_clamp(
+        let barriers = record_clamp(
             &warp.clamp,
             &warp.list,
             &dst_buf,
@@ -951,7 +968,8 @@ void main() {
             (&src_buf, ARGS_OFFSET as u64),
             Some((&count_buf, COUNT_OFFSET_1 as u64)),
             (KIND_DISPATCH, STRIDE, MAX),
-        ));
+        )
+        .expect("record the argument clamp");
         // SAFETY: open command list, valid worker PSO/root and buffers.
         unsafe {
             warp.list.SetComputeRootSignature(&warp.worker.root);
@@ -966,7 +984,7 @@ void main() {
                 COUNT_OFFSET_1 as u64,
             );
         }
-        done_on(&warp.list, &dst_buf);
+        done_on(&warp.list, &dst_buf, barriers);
 
         // Snapshot `dst_buf` after Call #1 (from `COMMON`, copy 5 * STRIDE bytes,
         // then return `dst_buf` to `COMMON` before Call #2).
@@ -988,7 +1006,7 @@ void main() {
 
         // Call #2 in the SAME command list (`eff_count = 2` -> records 0 and 1:
         // 6 + 5 = 11 groups). Would run empty if Call #1's tail blew `BUDGET`!
-        assert!(record_clamp(
+        let barriers = record_clamp(
             &warp.clamp,
             &warp.list,
             &dst_buf,
@@ -996,7 +1014,8 @@ void main() {
             (&src_buf, ARGS_OFFSET as u64),
             Some((&count_buf, COUNT_OFFSET_2 as u64)),
             (KIND_DISPATCH, STRIDE, MAX),
-        ));
+        )
+        .expect("record the argument clamp");
         // SAFETY: open command list, valid worker PSO/root and buffers.
         unsafe {
             warp.list.SetComputeRootSignature(&warp.worker.root);
@@ -1011,7 +1030,7 @@ void main() {
                 COUNT_OFFSET_2 as u64,
             );
         }
-        done_on(&warp.list, &dst_buf);
+        done_on(&warp.list, &dst_buf, barriers);
 
         warp.submit_and_wait();
 
@@ -1105,7 +1124,7 @@ void main() {
                 std::ptr::write_bytes(budget_ptr, 0, 256);
                 std::ptr::write_bytes(readback_ptr, 0, total);
             }
-            assert!(record_clamp_as(
+            let barriers = record_clamp_as(
                 &warp.clamp,
                 &warp.list,
                 &dst_buf,
@@ -1114,8 +1133,9 @@ void main() {
                 None,
                 (KIND_MESH, STRIDE, RECORDS),
                 ahead,
-            ));
-            done_on(&warp.list, &dst_buf);
+            )
+            .expect("record the argument clamp");
+            done_on(&warp.list, &dst_buf, barriers);
             // SAFETY: an open list; the scratch buffer is copied for the check.
             unsafe {
                 warp.list.ResourceBarrier(&[transition(
@@ -1198,7 +1218,7 @@ void main() {
             std::ptr::write_bytes(readback_ptr, 0, total_bytes);
         }
 
-        assert!(record_clamp(
+        let barriers = record_clamp(
             &warp.clamp,
             &warp.list,
             &dst_buf,
@@ -1206,8 +1226,9 @@ void main() {
             (&src_buf, 0),
             None,
             (KIND_INDEXED, STRIDE, RECORDS),
-        ));
-        done_on(&warp.list, &dst_buf);
+        )
+        .expect("record the argument clamp");
+        done_on(&warp.list, &dst_buf, barriers);
 
         // SAFETY: open command list; copy clamped scratch buffer for verification.
         unsafe {
@@ -1291,8 +1312,8 @@ void main() {
         let b2 = bound(&list, (&src_buf, 64), Some((&count_buf, 0)), (1, 20, 128)).unwrap();
         done(&list, &b2);
         assert_eq!(
-            b1.as_raw(),
-            b2.as_raw(),
+            b1.buffer.as_raw(),
+            b2.buffer.as_raw(),
             "scratch buffer within capacity must be reused"
         );
 
@@ -1301,8 +1322,8 @@ void main() {
         let b3 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 5000)).unwrap();
         done(&list, &b3);
         assert_ne!(
-            b3.as_raw(),
-            b1.as_raw(),
+            b3.buffer.as_raw(),
+            b1.buffer.as_raw(),
             "larger request must grow scratch buffer"
         );
 
@@ -1315,8 +1336,8 @@ void main() {
         let b4 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 4096)).unwrap();
         done(&list, &b4);
         assert_eq!(
-            b4.as_raw(),
-            b3.as_raw(),
+            b4.buffer.as_raw(),
+            b3.buffer.as_raw(),
             "grown scratch buffer must persist across reset"
         );
         list.close();
