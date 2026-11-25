@@ -884,6 +884,114 @@ mod tests {
         }
     }
 
+    /// Reads a table entry as data and writes its address to a separate UAV.
+    fn store_wide_descriptor_address(
+        dwords: u8,
+        extra_word: bool,
+    ) -> Result<HostShader, ShaderError> {
+        use crate::{ResourceType, RootParam, UsedResource, gfx10};
+
+        let words = [
+            0xBE81_0380u32, // s_mov_b32 s1, 0
+            0xF410_0200,
+            0xFA00_0000, // s_load_dwordx16 s[8:23], s[0:1], 0
+            0xF408_0600,
+            0xFA00_0040, // s_load_dwordx4 s[24:27], s[0:1], 64
+            0x7E02_0208, // v_mov_b32 v1, s8
+            0x7E04_0209, // v_mov_b32 v2, s9
+            // v_xor_b32 v2, s23 (or 0), v2
+            if extra_word { 0x3A04_0417 } else { 0x3A04_0480 },
+            0x3406_0083, // v_lshlrev_b32 v3, 3, v0
+            0xE074_1000,
+            0x8006_0103, // buffer_store_dwordx2 v[1:2], v3, s[24:27], 0 offen
+            0xBF81_0000, // s_endpgm
+        ];
+        let table_entry = |kind, table_offset_dwords, dwords| UsedResource {
+            kind,
+            root: RootType::Table,
+            table_offset_dwords,
+            lower_bound: 0,
+            stride: 0,
+            dwords,
+            user_data: 0,
+            slot: 0,
+        };
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 4,
+            layout: vec![RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            }],
+            used: vec![
+                table_entry(ResourceType::Srv, 0, dwords),
+                table_entry(ResourceType::Uav, 16, 4),
+            ],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 2,
+                threads: [32, 1, 1],
+            }),
+            code: words.iter().flat_map(|word| word.to_le_bytes()).collect(),
+        };
+        let decoded = gfx10::decode(&native.code).expect("decode descriptor test program");
+        assert_eq!(decoded[1].name(), Some("s_load_dwordx16"));
+        assert_eq!(decoded[7].name(), Some("buffer_store_dwordx2"));
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let bytes = crate::dxbc::build(&[]);
+        let container = Container::parse(&bytes).unwrap();
+        emit(&container, &native, &p, &st, &io, &res)
+    }
+
+    #[test]
+    fn a_sixteen_dword_descriptor_load_supplies_both_address_words() {
+        for dwords in [4, 8] {
+            let shader = store_wide_descriptor_address(dwords, false)
+                .expect("descriptor address translates");
+            let words: Vec<_> = shader
+                .user_data
+                .iter()
+                .filter_map(|u| {
+                    let RootType::Other(word) = u.root else {
+                        return None;
+                    };
+                    (word == USER_VIEW_ADDRESS || word == USER_VIEW_ADDRESS + 1)
+                        .then_some((word, u.slot, u.dword))
+                })
+                .collect();
+            assert_eq!(
+                words,
+                [(USER_VIEW_ADDRESS, 0, 0), (USER_VIEW_ADDRESS + 1, 0, 0)]
+            );
+            #[cfg(windows)]
+            if let Some(path) = std::env::var_os("VICTORY_DXIL") {
+                let mut validator = validator::Validator::load(Some(std::path::Path::new(&path)))
+                    .expect("load the requested DXIL validator");
+                validator
+                    .validate(&mut shader.dxil.clone())
+                    .expect("validate the descriptor address shader");
+            }
+        }
+    }
+
+    #[test]
+    fn a_sixteen_dword_descriptor_load_refuses_storing_a_missing_word() {
+        assert_eq!(
+            store_wide_descriptor_address(4, true).err(),
+            Some(ShaderError::Unsupported {
+                offset: 0x24,
+                what: "a descriptor's address or format read as data",
+            })
+        );
+    }
+
     /// A wave64 compute program: `body`, then a store of v1 to a UAV.
     fn stores_v1(body: &[u32]) -> Result<(), ShaderError> {
         use crate::native::RootParam;
