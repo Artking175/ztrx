@@ -906,8 +906,13 @@ mod difference_tests {
 }
 
 /// Grow copy-back scratch only for bytes that will actually be read.
-fn copyback_scratch(scratch: &mut Vec<u8>, len: usize) -> &mut [u8] {
+fn copyback_scratch(scratch: &mut Vec<u8>, len: usize, limit: usize) -> &mut [u8] {
+    debug_assert!(len <= limit);
     if scratch.len() < len {
+        // Keep normal Vec growth until doubling would outgrow the piece.
+        if len > scratch.capacity() && scratch.capacity() > limit / 2 {
+            scratch.reserve_exact(limit - scratch.len());
+        }
         scratch.resize(len, 0);
     }
     &mut scratch[..len]
@@ -915,19 +920,32 @@ fn copyback_scratch(scratch: &mut Vec<u8>, len: usize) -> &mut [u8] {
 
 #[cfg(test)]
 mod copyback_scratch_tests {
-    use super::copyback_scratch;
+    use super::{PIECE, copyback_scratch};
 
     #[test]
     fn scratch_is_lazy_and_reuses_storage() {
         let mut scratch = Vec::new();
-        assert!(copyback_scratch(&mut scratch, 0).is_empty());
+        assert!(copyback_scratch(&mut scratch, 0, PIECE).is_empty());
         assert_eq!(scratch.capacity(), 0);
-        copyback_scratch(&mut scratch, 8).fill(7);
+        copyback_scratch(&mut scratch, 8, PIECE).fill(7);
         let ptr = scratch.as_ptr();
-        assert_eq!(copyback_scratch(&mut scratch, 2), &[7, 7]);
+        assert_eq!(copyback_scratch(&mut scratch, 2, PIECE), &[7, 7]);
         assert_eq!(scratch.as_ptr(), ptr);
         assert_eq!(scratch.len(), 8);
-        assert_eq!(copyback_scratch(&mut scratch, 10), &[7, 7, 7, 7, 7, 7, 7, 7, 0, 0]);
+        assert_eq!(
+            copyback_scratch(&mut scratch, 10, PIECE),
+            &[7, 7, 7, 7, 7, 7, 7, 7, 0, 0]
+        );
+    }
+
+    #[test]
+    fn scratch_growth_stays_within_one_piece() {
+        let mut scratch = Vec::new();
+        copyback_scratch(&mut scratch, 48 << 10, PIECE).fill(7);
+        let whole = copyback_scratch(&mut scratch, PIECE, PIECE);
+        assert!(whole[..48 << 10].iter().all(|&byte| byte == 7));
+        assert!(whole[48 << 10..].iter().all(|&byte| byte == 0));
+        assert_eq!(scratch.capacity(), PIECE);
     }
 }
 
@@ -1956,7 +1974,7 @@ impl Shadow {
                 let last = last_difference(host, old).unwrap_or(first);
                 let (at, n) = (at + first, last + 1 - first);
                 let (host, old) = (&mut host[first..=last], &old[first..=last]);
-                let title = copyback_scratch(&mut title, n);
+                let title = copyback_scratch(&mut title, n, PIECE);
                 if !crate::host::read_into((start + at) as *const u8, title) {
                     continue;
                 }
@@ -2303,7 +2321,7 @@ impl Shadow {
                     continue;
                 }
                 let n = hi - lo;
-                let title = copyback_scratch(&mut title, n);
+                let title = copyback_scratch(&mut title, n, PAGE);
                 // The lock of the copy's reference (the snapshot, or the
                 // CPU's side of a copy in the card's memory), from before
                 // title memory is read until the title's bytes are in: with
